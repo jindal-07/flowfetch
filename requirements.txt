@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+itsdangerous
+python-dotenv
+pandas
+requests
+httpx
+playwright
+msal
+stream-zip

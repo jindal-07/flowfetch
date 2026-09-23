@@ -1,0 +1,12 @@
+downloads/
+downloads_sharepoint/
+auth/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.idea/
+.vscode/
+*.csv
+.env

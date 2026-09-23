@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: flowfetch
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      # Microsoft Graph (SharePoint) — fill these in the Render dashboard.
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: AZURE_CLIENT_SECRET
+        sync: false
+      - key: AZURE_TENANT_ID
+        sync: false
+      # Must be https://<your-service>.onrender.com/auth/callback and match
+      # the redirect URI registered in the Azure app registration.
+      - key: AZURE_REDIRECT_URI
+        sync: false

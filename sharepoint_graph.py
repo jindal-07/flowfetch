@@ -1,5 +1,5 @@
 """
-SharePoint downloader using Microsoft Graph (delegated auth).
+SharePoint downloader using Microsoft Graph (app-only auth).
 
 Same interface as the legacy sharepoint_downloader (process_single, process_links,
 process_folder) but every API call goes through https://graph.microsoft.com with
@@ -275,7 +275,7 @@ async def process_folder(
 
     token = token_getter()
     if not token:
-        raise RuntimeError("Not signed in to Microsoft. Sign in first.")
+        raise RuntimeError("SharePoint access is not configured (check the Azure app credentials).")
 
     _emit(on_progress, 0, 0, "Extracting media list from folder...", "info")
     items = await asyncio.to_thread(extract_media_from_folder, folder_url, token, media_only)
@@ -384,7 +384,7 @@ async def process_single(
 
     token = token_getter()
     if not token:
-        raise RuntimeError("Not signed in to Microsoft. Sign in first.")
+        raise RuntimeError("SharePoint access is not configured (check the Azure app credentials).")
 
     _emit(on_progress, 1, 1, f"Resolving: {url}", "processing")
     meta = await asyncio.to_thread(resolve_single_file, url, token)
@@ -422,7 +422,7 @@ async def crawl_folder(
     """
     token = token_getter()
     if not token:
-        raise RuntimeError("Not signed in to Microsoft. Sign in first.")
+        raise RuntimeError("SharePoint access is not configured (check the Azure app credentials).")
 
     _emit(on_progress, 0, 0, "Crawling SharePoint folder...", "info")
 
@@ -584,7 +584,7 @@ async def resolve_single_stream(
     """
     token = token_getter()
     if not token:
-        raise RuntimeError("Not signed in to Microsoft. Sign in first.")
+        raise RuntimeError("SharePoint access is not configured (check the Azure app credentials).")
     meta = await asyncio.to_thread(resolve_single_file, url, token)
     name = _safe_filename(meta.get("name") or "sharepoint_file")
     dl = meta.get("download_url") or ""

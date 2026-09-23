@@ -970,6 +970,12 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
           How it works
         </button>
+        <form method="post" action="/logout" id="logout-form" hidden>
+          <button class="help-btn" type="submit">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            Log out
+          </button>
+        </form>
         <div class="top-right">v1.0</div>
       </div>
     </div>
@@ -1101,16 +1107,6 @@
             <span id="sp-auth-text">Checking…</span>
           </div>
           <div class="auth-actions">
-            <a class="btn-ghost accent" id="sp-btn-msft" href="/auth/login" target="_blank" rel="opener" style="display:none;">
-              <svg viewBox="0 0 23 23" width="13" height="13" aria-hidden="true">
-                <rect x="1" y="1" width="10" height="10" fill="#F25022"/>
-                <rect x="12" y="1" width="10" height="10" fill="#7FBA00"/>
-                <rect x="1" y="12" width="10" height="10" fill="#00A4EF"/>
-                <rect x="12" y="12" width="10" height="10" fill="#FFB900"/>
-              </svg>
-              Sign in with Microsoft
-            </a>
-            <button class="btn-ghost" id="sp-btn-logout" style="display:none;">Sign out</button>
             <button class="btn-ghost" id="sp-btn-login" style="display:none;">Local login</button>
             <label class="btn-ghost" id="sp-upload-label" for="sp-auth-upload" style="display:none;">Upload state.json</label>
             <input type="file" id="sp-auth-upload" class="auth-upload-input" accept=".json" />
@@ -1335,7 +1331,7 @@
             SharePoint
           </div>
           <ul>
-            <li><strong>Sign in first</strong> — use <em>Sign in with Microsoft</em>. Running locally, you can also do a browser login or upload a <code>state.json</code>. The auth status shows at the top of the tab.</li>
+            <li><strong>No sign-in</strong> — the server connects to SharePoint with the organisation's app access. The status at the top of the tab shows whether it's connected.</li>
             <li><strong>Single link</strong> / <strong>CSV upload</strong> — download one share link or a whole CSV of them.</li>
             <li><strong>Folder → CSV</strong> — paste a folder share link (the <code>:f:</code> kind). FlowFetch crawls it recursively and hands you a <strong>manifest CSV</strong> of every file. Re-upload that CSV under “CSV upload” to download the files.</li>
           </ul>
@@ -1375,6 +1371,21 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
+
+    // Password gate: show "Log out" when enabled, and send the user back to the
+    // login screen if their cookie expires mid-session.
+    fetch("/api/gate").then(r => r.json()).then(d => { if (d.enabled) $("logout-form").hidden = false; }).catch(() => {});
+    {
+      const _fetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        const res = await _fetch(...args);
+        if (res.status === 401 && res.headers.get("content-type")?.includes("application/json")) {
+          const body = await res.clone().json().catch(() => ({}));
+          if (String(body.detail || "").startsWith("Not logged in")) location.reload();
+        }
+        return res;
+      };
+    }
     const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
     }[c]));
@@ -1710,8 +1721,6 @@
 
     const spDot = $("sp-dot");
     const spAuthText = $("sp-auth-text");
-    const spBtnMsft = $("sp-btn-msft");
-    const spBtnLogout = $("sp-btn-logout");
     const spBtnLogin = $("sp-btn-login");
     const spUploadLabel = $("sp-upload-label");
     const spAuthUpload = $("sp-auth-upload");
@@ -1721,57 +1730,29 @@
         const res = await fetch("/api/sharepoint/auth-status");
         const data = await res.json();
 
-        [spBtnMsft, spBtnLogout, spBtnLogin, spUploadLabel].forEach(el => el.style.display = "none");
-
-        const useLocalLogin = data.is_local;
-        const useGraph = !data.is_local && data.graph_configured;
+        [spBtnLogin, spUploadLabel].forEach(el => el.style.display = "none");
+        const useLocalLogin = data.is_local && data.method !== "app";
 
         if (data.logged_in) {
           spDot.classList.add("ok");
-          if (data.method === "app") {
-            spAuthText.textContent = "Connected via organisation app access";
-          } else if (data.method === "graph") {
-            spAuthText.textContent = data.email ? `Signed in as ${data.email}` : "Signed in via Microsoft";
-            spBtnLogout.style.display = "inline-flex";
-          } else {
-            spAuthText.textContent = useLocalLogin
-              ? "Local login active (cookie state loaded)"
-              : "Cookie auth loaded";
-            if (useGraph) spBtnMsft.style.display = "inline-flex";
-            if (useLocalLogin) {
-              spBtnLogin.style.display = "inline-flex";
-              spUploadLabel.style.display = "inline-flex";
-            }
-          }
+          spAuthText.textContent = data.method === "app"
+            ? "Connected via organisation app access"
+            : "Local login active (cookie state loaded)";
         } else {
           spDot.classList.remove("ok");
-          if (useGraph) {
-            spAuthText.textContent = "Sign in with Microsoft to continue";
-            spBtnMsft.style.display = "inline-flex";
-          } else if (useLocalLogin) {
-            spAuthText.textContent = "Not signed in — use local login";
-            spBtnLogin.style.display = "inline-flex";
-            spUploadLabel.style.display = "inline-flex";
-          } else {
-            spAuthText.textContent = "Not signed in (Microsoft sign-in not configured)";
-            spUploadLabel.style.display = "inline-flex";
-          }
+          spAuthText.textContent = useLocalLogin
+            ? "Not connected — use local login"
+            : "SharePoint access is not configured on this server";
+        }
+        if (useLocalLogin) {
+          spBtnLogin.style.display = "inline-flex";
+          spUploadLabel.style.display = "inline-flex";
         }
       } catch {
         spAuthText.textContent = "Could not check auth";
       }
     }
-    spBtnLogout.addEventListener("click", async () => {
-      try { await fetch("/auth/logout", { method: "POST" }); } catch {}
-      refreshSpAuth();
-    });
 
-    // Microsoft sign-in opens in a new tab via the <a target="_blank"> button.
-    window.addEventListener("message", (e) => {
-      if (e && e.data && (e.data.type === "flowfetch:auth-success" || e.data.type === "vellum:auth-success")) {
-        refreshSpAuth();
-      }
-    });
     window.addEventListener("focus", () => {
       if (document.getElementById("pane-sp").classList.contains("active")) refreshSpAuth();
     });

@@ -27,63 +27,24 @@ except ImportError:
     pass
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
-from starlette.middleware.sessions import SessionMiddleware
+from fastapi.responses import HTMLResponse, StreamingResponse
 from stream_zip import ZIP_64, async_stream_zip
 
 import fb_video_downloader as downloader
 import sharepoint_downloader as sp_downloader
 import sharepoint_graph as sp_graph
 import msgraph_auth
+import auth_gate
 import google_drive as gd
 
 app = FastAPI(title="FlowFetch")
 
-# Signed-cookie sessions.
-import secrets as _secrets
-SESSION_SECRET = os.environ.get("SESSION_SECRET") or _secrets.token_urlsafe(32)
-
-# On Hugging Face Spaces the app is embedded inside an <iframe>, so the cookie
-# must be SameSite=None + Secure to be sent. Locally we keep SameSite=Lax.
-_ON_HF = bool(os.environ.get("SPACE_ID") or os.environ.get("SPACE_HOST"))
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SESSION_SECRET,
-    https_only=_ON_HF,
-    same_site="none" if _ON_HF else "lax",
-)
-
-class BasicAuthGate:
-    """HTTP Basic auth over the whole app when FLOWFETCH_PASSWORD is set.
-    Pure ASGI so SSE and ZIP streaming responses pass through untouched."""
-
-    def __init__(self, app, password: str, username: str):
-        import base64
-        self.app = app
-        self.expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("path") == "/healthz":
-            return await self.app(scope, receive, send)
-        auth = dict(scope.get("headers") or []).get(b"authorization", b"").decode("latin-1")
-        if _secrets.compare_digest(auth, self.expected):
-            return await self.app(scope, receive, send)
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [(b"www-authenticate", b'Basic realm="FlowFetch"'),
-                        (b"content-type", b"text/plain")],
-        })
-        await send({"type": "http.response.body", "body": b"Authentication required."})
-
-
-_GATE_PASSWORD = os.environ.get("FLOWFETCH_PASSWORD", "").strip()
-if _GATE_PASSWORD:
-    app.add_middleware(BasicAuthGate, password=_GATE_PASSWORD,
-                       username=os.environ.get("FLOWFETCH_USERNAME", "flowfetch").strip() or "flowfetch")
-elif msgraph_auth.APP_ONLY:
-    print("[auth] WARNING: AZURE_AUTH_MODE=app without FLOWFETCH_PASSWORD - anyone with the "
-          "URL can read every SharePoint file the app registration can access.")
+app.include_router(auth_gate.router)
+if auth_gate.ENABLED:
+    app.add_middleware(auth_gate.PasswordGate)
+elif msgraph_auth.is_configured():
+    print("[auth] WARNING: FLOWFETCH_PASSWORD is not set - anyone with the URL can read every "
+          "SharePoint file the app registration can access.")
 
 BASE_DIR = Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
@@ -321,7 +282,7 @@ async def check_link(request: Request, source: str, url: str):
         if source == "sharepoint":
             method = _sp_auth_check(request)
             if method == "graph":
-                name, _ = await sp_graph.resolve_single_stream(url, _sp_token_getter(request))
+                name, _ = await sp_graph.resolve_single_stream(url, msgraph_auth.get_access_token)
             else:
                 name, _ = await sp_downloader.resolve_single_stream(url, SP_STATE_FILE)
             return {"ok": True, "reason": "", "filename": name}
@@ -354,7 +315,7 @@ async def sp_single_bin(request: Request, url: str):
     try:
         if method == "graph":
             filename, byte_iter = await sp_graph.resolve_single_stream(
-                url, _sp_token_getter(request)
+                url, msgraph_auth.get_access_token
             )
         else:
             filename, byte_iter = await sp_downloader.resolve_single_stream(
@@ -398,7 +359,6 @@ async def csv_plan(
 
     content = await file.read()
     sp_method = None
-    sid = None
 
     if source == "facebook":
         try:
@@ -415,7 +375,6 @@ async def csv_plan(
             raise HTTPException(400, f"Could not parse CSV: {e}")
         if not links:
             raise HTTPException(400, "No SharePoint links found in the CSV.")
-        sid = _session_id(request) if sp_method == "graph" else None
     else:  # gdrive
         try:
             links = gd.parse_links_from_csv_bytes(content)
@@ -431,7 +390,6 @@ async def csv_plan(
         "csv",
         source=source,
         sp_method=sp_method,
-        sp_sid=sid,
         links=links,
         total=len(links),
         batches=batches,
@@ -466,7 +424,7 @@ def _build_batch_generator(job: dict, batch: dict):
         links_slice = job["links"][start:end]
         if job["sp_method"] == "graph":
             return sp_graph.iter_batch_files(
-                links_slice, _sp_token_getter_for_sid(job.get("sp_sid")),
+                links_slice, msgraph_auth.get_access_token,
                 on_progress, cancel,
                 batch_offset=start, overall_total=total,
             )
@@ -633,7 +591,7 @@ async def _crawl_task(job_id: str, url: str, method: str):
     cancel = lambda: job["cancelled"]
     try:
         if method == "graph":
-            token_getter = _sp_token_getter_for_sid(job.get("sp_sid"))
+            token_getter = msgraph_auth.get_access_token
             result = await sp_graph.crawl_folder(
                 url, token_getter, on_progress, True, cancel
             )
@@ -686,13 +644,11 @@ async def sp_folder_start(request: Request, url: str = Form(...)):
         raise HTTPException(400, "Link doesn't look like a folder share (missing ':f:').")
 
     method = _sp_auth_check(request)
-    sid = _session_id(request) if method == "graph" else None
 
     job_id = jobs.create(
         "sp_folder",
         source="sp_folder",
         sp_method=method,
-        sp_sid=sid,
         total=0,
         next_batch=1,
         batches=[],
@@ -910,40 +866,16 @@ async def gd_folder_start(url: str = Form(...)):
 
 
 # ---------------------------------------------------------------------------
-# Microsoft Graph OAuth (delegated, auth-code flow)
+# Microsoft Graph (app-only access)
 # ---------------------------------------------------------------------------
 
-def _session_id(request: Request) -> Optional[str]:
-    return request.session.get("sid")
-
-
-def _ensure_session_id(request: Request) -> str:
-    sid = request.session.get("sid")
-    if not sid:
-        sid = msgraph_auth.new_session_id()
-        request.session["sid"] = sid
-    return sid
-
-
-def _graph_token(sid: Optional[str]) -> Optional[str]:
-    """Delegated or app-only token; app-only failures surface as 'not signed in'."""
+def _graph_token() -> Optional[str]:
+    """App-only token; failures (bad credentials, network) read as 'not connected'."""
     try:
-        return msgraph_auth.get_access_token(sid)
+        return msgraph_auth.get_access_token()
     except RuntimeError as e:
         print(f"[auth] {e}")
         return None
-
-
-@app.get("/auth/status")
-async def auth_status(request: Request):
-    sid = _session_id(request)
-    token = await asyncio.to_thread(_graph_token, sid)
-    return {
-        "configured": msgraph_auth.is_configured(),
-        "mode": msgraph_auth.AUTH_MODE,
-        "signed_in": bool(token),
-        "email": msgraph_auth.session_email(sid),
-    }
 
 
 @app.get("/auth/debug")
@@ -956,106 +888,31 @@ async def auth_debug():
             return "PLACEHOLDER"
         return "OK"
     info = {
-        "AZURE_AUTH_MODE": msgraph_auth.AUTH_MODE,
         "AZURE_CLIENT_ID": status(msgraph_auth.CLIENT_ID),
         "AZURE_CLIENT_SECRET": status(msgraph_auth.CLIENT_SECRET),
-        "AZURE_TENANT_ID": status(msgraph_auth.TENANT_ID if msgraph_auth.TENANT_ID != "common" else ""),
+        "AZURE_TENANT_ID": status(msgraph_auth.TENANT_ID),
         "is_configured": msgraph_auth.is_configured(),
+        "password_gate": auth_gate.ENABLED,
     }
-    if msgraph_auth.APP_ONLY:
-        try:
-            info["app_token"] = "OK" if await asyncio.to_thread(msgraph_auth.get_app_token) else "NOT CONFIGURED"
-        except RuntimeError as e:
-            info["app_token"] = f"ERROR: {e}"
-    else:
-        info["AZURE_REDIRECT_URI"] = status(msgraph_auth.REDIRECT_URI)
-        info["redirect_uri_value"] = msgraph_auth.REDIRECT_URI
-    return info
-
-
-@app.get("/auth/login")
-async def auth_login(request: Request):
-    if msgraph_auth.APP_ONLY:
-        return RedirectResponse("/")
-    if not msgraph_auth.is_configured():
-        raise HTTPException(500, "Microsoft Graph auth is not configured on this server.")
-    state = msgraph_auth.new_session_id()
-    request.session["oauth_state"] = state
-    _ensure_session_id(request)
-    return RedirectResponse(msgraph_auth.build_auth_url(state))
-
-
-@app.get("/auth/callback")
-async def auth_callback(request: Request, code: Optional[str] = None,
-                        state: Optional[str] = None, error: Optional[str] = None):
-    if error:
-        raise HTTPException(400, f"OAuth error: {error}")
-    if not code or not state:
-        raise HTTPException(400, "Missing code or state.")
-    expected_state = request.session.get("oauth_state")
-    if state != expected_state:
-        raise HTTPException(400, "State mismatch (possible CSRF).")
-
-    sid = _ensure_session_id(request)
     try:
-        msgraph_auth.acquire_token_from_code(code, sid)
-    except Exception as e:
-        raise HTTPException(400, f"Token exchange failed: {e}")
-
-    request.session.pop("oauth_state", None)
-    return HTMLResponse("""
-<!DOCTYPE html>
-<html><head><title>Signed in</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5ef;color:#1f1f14;
-display:grid;place-items:center;height:100vh;margin:0;text-align:center}
-.box{background:#ffffff;border:1px solid #d8d8c0;border-radius:18px;padding:32px 40px;
-box-shadow:0 4px 24px rgba(31,31,20,0.08)}
-.dot{width:38px;height:38px;border-radius:50%;background:#b47818;margin:0 auto 14px;
-display:grid;place-items:center;color:#fcf5e9;font-weight:700}
-h1{font-size:1.1rem;margin:0 0 6px;color:#1f1f14}p{margin:0;color:#5e5e3b;font-size:.9rem}</style></head>
-<body><div class="box"><div class="dot">&check;</div><h1>Signed in successfully</h1><p>You can close this window.</p></div>
-<script>
-  try {
-    if (window.opener && !window.opener.closed) {
-      window.opener.postMessage({ type: "flowfetch:auth-success" }, "*");
-    }
-  } catch (e) {}
-  setTimeout(() => { try { window.close(); } catch (e) {} }, 800);
-  setTimeout(() => { if (!window.closed) location.replace("/"); }, 2000);
-</script></body></html>
-""")
-
-
-@app.post("/auth/logout")
-async def auth_logout(request: Request):
-    sid = _session_id(request)
-    msgraph_auth.clear_session(sid)
-    request.session.clear()
-    return {"ok": True}
+        info["app_token"] = "OK" if await asyncio.to_thread(msgraph_auth.get_access_token) else "NOT CONFIGURED"
+    except RuntimeError as e:
+        info["app_token"] = f"ERROR: {e}"
+    return info
 
 
 # ---------------------------------------------------------------------------
 # SharePoint auth helpers
 # ---------------------------------------------------------------------------
 
-def _sp_token_getter_for_sid(sid: Optional[str]):
-    def _get():
-        return msgraph_auth.get_access_token(sid)
-    return _get
-
-
-def _sp_token_getter(request: Request):
-    return _sp_token_getter_for_sid(_session_id(request))
-
-
 def _sp_auth_check(request: Request) -> str:
     """Return 'graph' or 'cookie' depending on which auth is available."""
-    sid = _session_id(request)
-    if _graph_token(sid):
+    if _graph_token():
         return "graph"
     if sp_downloader.auth_state_exists(SP_STATE_FILE):
         return "cookie"
-    raise HTTPException(400, "Not signed in. Use 'Sign in with Microsoft' (or upload a state.json) first.")
+    raise HTTPException(400, "SharePoint access is not configured. Set the Azure app credentials "
+                             "on the server (or, locally, upload a state.json).")
 
 
 def _is_local_host(request: Request) -> bool:
@@ -1065,17 +922,11 @@ def _is_local_host(request: Request) -> bool:
 
 @app.get("/api/sharepoint/auth-status")
 async def sp_auth_status(request: Request):
-    sid = _session_id(request)
-    graph_token = await asyncio.to_thread(_graph_token, sid)
+    graph_token = await asyncio.to_thread(_graph_token)
     cookie_ok = sp_downloader.auth_state_exists(SP_STATE_FILE)
-    if graph_token:
-        method = "app" if msgraph_auth.APP_ONLY else "graph"
-    else:
-        method = "cookie" if cookie_ok else None
     return {
         "logged_in": bool(graph_token or cookie_ok),
-        "method": method,
-        "email": msgraph_auth.session_email(sid),
+        "method": "app" if graph_token else ("cookie" if cookie_ok else None),
         "graph_configured": msgraph_auth.is_configured(),
         "is_local": _is_local_host(request),
     }

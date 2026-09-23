@@ -5,24 +5,19 @@ services:
     plan: free
     healthCheckPath: /healthz
     envVars:
-      # Microsoft Graph (SharePoint) — fill these in the Render dashboard.
+      # Microsoft Graph app-only access (Application permission Files.Read.All
+      # with admin consent). Fill these in the Render dashboard.
       - key: AZURE_CLIENT_ID
         sync: false
       - key: AZURE_CLIENT_SECRET
         sync: false
+      # Your real tenant ID; "common" cannot issue app-only tokens.
       - key: AZURE_TENANT_ID
         sync: false
-      # "app" = Application permissions (client credentials, no user sign-in).
-      # Requires a real AZURE_TENANT_ID (not "common").
-      - key: AZURE_AUTH_MODE
-        value: app
-      # Password-protects the whole site (browser prompt). Strongly
-      # recommended in app mode, since the server can read all tenant files.
+      # Password for the login screen. Strongly recommended, since the
+      # server can read all tenant files. Changing it logs everyone out.
       - key: FLOWFETCH_PASSWORD
         sync: false
-      - key: FLOWFETCH_USERNAME
-        sync: false
-      # Only used in delegated mode:
-      # https://<your-service>.onrender.com/auth/callback
-      - key: AZURE_REDIRECT_URI
-        sync: false
+      # How long "Remember me" keeps a device logged in.
+      - key: FLOWFETCH_REMEMBER_DAYS
+        value: "30"

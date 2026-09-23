@@ -27,11 +27,22 @@ CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET", "").strip()
 TENANT_ID = os.environ.get("AZURE_TENANT_ID", "common").strip() or "common"
 REDIRECT_URI = os.environ.get("AZURE_REDIRECT_URI", "").strip()
 
+# "delegated" (default): each user signs in; Graph enforces their own access.
+# "app": client-credentials flow using Application permissions. No sign-in;
+# the server can read every file the app registration is granted, so the
+# deployment must be protected (see FLOWFETCH_PASSWORD in app.py).
+AUTH_MODE = os.environ.get("AZURE_AUTH_MODE", "delegated").strip().lower()
+APP_ONLY = AUTH_MODE == "app"
+
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
 
 # Only the resource scopes here. MSAL injects `openid profile offline_access`.
 SCOPES = ["https://graph.microsoft.com/Files.Read.All",
           "https://graph.microsoft.com/User.Read"]
+
+# App-only tokens always use `.default`: whatever Application permissions
+# have been admin-consented on the registration.
+APP_SCOPES = ["https://graph.microsoft.com/.default"]
 
 
 def _looks_like_placeholder(v: str) -> bool:
@@ -39,6 +50,12 @@ def _looks_like_placeholder(v: str) -> bool:
 
 
 def is_configured() -> bool:
+    if APP_ONLY:
+        # Client credentials needs a real tenant; "common" can't issue app tokens.
+        required = (CLIENT_ID, CLIENT_SECRET, TENANT_ID)
+        if not all(required) or TENANT_ID in ("common", "organizations", "consumers"):
+            return False
+        return not any(_looks_like_placeholder(x) for x in required)
     if not (CLIENT_ID and CLIENT_SECRET and REDIRECT_URI):
         return False
     if any(_looks_like_placeholder(x) for x in (CLIENT_ID, CLIENT_SECRET, TENANT_ID, REDIRECT_URI)):
@@ -128,11 +145,38 @@ def acquire_token_from_code(code: str, session_id: str) -> dict:
     return result
 
 
-def get_access_token(session_id: str) -> Optional[str]:
+_APP_CLIENT: Optional[msal.ConfidentialClientApplication] = None
+
+
+def get_app_token() -> Optional[str]:
+    """App-only token via client credentials. MSAL caches it in-process and
+    only hits Entra ID again when it is close to expiry."""
+    global _APP_CLIENT
+    if not is_configured():
+        return None
+    try:
+        if _APP_CLIENT is None:
+            _APP_CLIENT = _build_msal_app()
+        result = _APP_CLIENT.acquire_token_for_client(scopes=APP_SCOPES)
+    except Exception as e:  # bad tenant ID, network failure, etc.
+        raise RuntimeError(f"App-only token request failed: {e}") from e
+    if "access_token" not in result:
+        raise RuntimeError(
+            f"App-only token request failed: {result.get('error')}: {result.get('error_description')}"
+        )
+    return result["access_token"]
+
+
+def get_access_token(session_id: Optional[str]) -> Optional[str]:
     """
     Return a valid access token for the session, refreshing silently if needed.
-    Returns None if the session has no cached account.
+    Returns None if the session has no cached account. In app-only mode the
+    session is ignored and the shared application token is returned.
     """
+    if APP_ONLY:
+        return get_app_token()
+    if not session_id:
+        return None
     sess = _SESSIONS.get(session_id)
     if not sess:
         return None
@@ -148,6 +192,8 @@ def get_access_token(session_id: str) -> Optional[str]:
     return result["access_token"]
 
 
-def session_email(session_id: str) -> Optional[str]:
+def session_email(session_id: Optional[str]) -> Optional[str]:
+    if APP_ONLY or not session_id:
+        return None
     sess = _SESSIONS.get(session_id)
     return sess.get("email") if sess else None

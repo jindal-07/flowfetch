@@ -53,6 +53,38 @@ app.add_middleware(
     same_site="none" if _ON_HF else "lax",
 )
 
+class BasicAuthGate:
+    """HTTP Basic auth over the whole app when FLOWFETCH_PASSWORD is set.
+    Pure ASGI so SSE and ZIP streaming responses pass through untouched."""
+
+    def __init__(self, app, password: str, username: str):
+        import base64
+        self.app = app
+        self.expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") == "/healthz":
+            return await self.app(scope, receive, send)
+        auth = dict(scope.get("headers") or []).get(b"authorization", b"").decode("latin-1")
+        if _secrets.compare_digest(auth, self.expected):
+            return await self.app(scope, receive, send)
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [(b"www-authenticate", b'Basic realm="FlowFetch"'),
+                        (b"content-type", b"text/plain")],
+        })
+        await send({"type": "http.response.body", "body": b"Authentication required."})
+
+
+_GATE_PASSWORD = os.environ.get("FLOWFETCH_PASSWORD", "").strip()
+if _GATE_PASSWORD:
+    app.add_middleware(BasicAuthGate, password=_GATE_PASSWORD,
+                       username=os.environ.get("FLOWFETCH_USERNAME", "flowfetch").strip() or "flowfetch")
+elif msgraph_auth.APP_ONLY:
+    print("[auth] WARNING: AZURE_AUTH_MODE=app without FLOWFETCH_PASSWORD - anyone with the "
+          "URL can read every SharePoint file the app registration can access.")
+
 BASE_DIR = Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
 AUTH_DIR = BASE_DIR / "auth"
@@ -196,6 +228,11 @@ def _maybe_finalize_job(job_id: str):
 # ---------------------------------------------------------------------------
 # Index page
 # ---------------------------------------------------------------------------
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -888,15 +925,24 @@ def _ensure_session_id(request: Request) -> str:
     return sid
 
 
+def _graph_token(sid: Optional[str]) -> Optional[str]:
+    """Delegated or app-only token; app-only failures surface as 'not signed in'."""
+    try:
+        return msgraph_auth.get_access_token(sid)
+    except RuntimeError as e:
+        print(f"[auth] {e}")
+        return None
+
+
 @app.get("/auth/status")
 async def auth_status(request: Request):
     sid = _session_id(request)
-    email = msgraph_auth.session_email(sid) if sid else None
-    token = msgraph_auth.get_access_token(sid) if sid else None
+    token = await asyncio.to_thread(_graph_token, sid)
     return {
         "configured": msgraph_auth.is_configured(),
+        "mode": msgraph_auth.AUTH_MODE,
         "signed_in": bool(token),
-        "email": email,
+        "email": msgraph_auth.session_email(sid),
     }
 
 
@@ -909,18 +955,28 @@ async def auth_debug():
         if v.startswith("<") or v.endswith(">"):
             return "PLACEHOLDER"
         return "OK"
-    return {
+    info = {
+        "AZURE_AUTH_MODE": msgraph_auth.AUTH_MODE,
         "AZURE_CLIENT_ID": status(msgraph_auth.CLIENT_ID),
         "AZURE_CLIENT_SECRET": status(msgraph_auth.CLIENT_SECRET),
         "AZURE_TENANT_ID": status(msgraph_auth.TENANT_ID if msgraph_auth.TENANT_ID != "common" else ""),
-        "AZURE_REDIRECT_URI": status(msgraph_auth.REDIRECT_URI),
-        "redirect_uri_value": msgraph_auth.REDIRECT_URI,
         "is_configured": msgraph_auth.is_configured(),
     }
+    if msgraph_auth.APP_ONLY:
+        try:
+            info["app_token"] = "OK" if await asyncio.to_thread(msgraph_auth.get_app_token) else "NOT CONFIGURED"
+        except RuntimeError as e:
+            info["app_token"] = f"ERROR: {e}"
+    else:
+        info["AZURE_REDIRECT_URI"] = status(msgraph_auth.REDIRECT_URI)
+        info["redirect_uri_value"] = msgraph_auth.REDIRECT_URI
+    return info
 
 
 @app.get("/auth/login")
 async def auth_login(request: Request):
+    if msgraph_auth.APP_ONLY:
+        return RedirectResponse("/")
     if not msgraph_auth.is_configured():
         raise HTTPException(500, "Microsoft Graph auth is not configured on this server.")
     state = msgraph_auth.new_session_id()
@@ -984,7 +1040,7 @@ async def auth_logout(request: Request):
 
 def _sp_token_getter_for_sid(sid: Optional[str]):
     def _get():
-        return msgraph_auth.get_access_token(sid) if sid else None
+        return msgraph_auth.get_access_token(sid)
     return _get
 
 
@@ -995,7 +1051,7 @@ def _sp_token_getter(request: Request):
 def _sp_auth_check(request: Request) -> str:
     """Return 'graph' or 'cookie' depending on which auth is available."""
     sid = _session_id(request)
-    if sid and msgraph_auth.get_access_token(sid):
+    if _graph_token(sid):
         return "graph"
     if sp_downloader.auth_state_exists(SP_STATE_FILE):
         return "cookie"
@@ -1010,12 +1066,16 @@ def _is_local_host(request: Request) -> bool:
 @app.get("/api/sharepoint/auth-status")
 async def sp_auth_status(request: Request):
     sid = _session_id(request)
-    graph_token = msgraph_auth.get_access_token(sid) if sid else None
+    graph_token = await asyncio.to_thread(_graph_token, sid)
     cookie_ok = sp_downloader.auth_state_exists(SP_STATE_FILE)
+    if graph_token:
+        method = "app" if msgraph_auth.APP_ONLY else "graph"
+    else:
+        method = "cookie" if cookie_ok else None
     return {
         "logged_in": bool(graph_token or cookie_ok),
-        "method": "graph" if graph_token else ("cookie" if cookie_ok else None),
-        "email": msgraph_auth.session_email(sid) if sid else None,
+        "method": method,
+        "email": msgraph_auth.session_email(sid),
         "graph_configured": msgraph_auth.is_configured(),
         "is_local": _is_local_host(request),
     }

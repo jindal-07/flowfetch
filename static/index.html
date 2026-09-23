@@ -1728,7 +1728,9 @@
 
         if (data.logged_in) {
           spDot.classList.add("ok");
-          if (data.method === "graph") {
+          if (data.method === "app") {
+            spAuthText.textContent = "Connected via organisation app access";
+          } else if (data.method === "graph") {
             spAuthText.textContent = data.email ? `Signed in as ${data.email}` : "Signed in via Microsoft";
             spBtnLogout.style.display = "inline-flex";
           } else {

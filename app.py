@@ -8,6 +8,7 @@ import sys
 import time
 import uuid
 import warnings
+import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,12 @@ except ImportError:
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from stream_zip import ZIP_64, async_stream_zip
+
+
+def _store_compressobj():
+    # Level 0: media is already compressed, so deflating it again saves ~nothing
+    # but costs a lot of CPU (Render's free tier has 0.1 vCPU).
+    return zlib.compressobj(level=0, wbits=-zlib.MAX_WBITS)
 
 import fb_video_downloader as downloader
 import sharepoint_downloader as sp_downloader
@@ -530,7 +537,7 @@ async def stream_batch(job_id: str, n: int):
 
     async def response_body():
         try:
-            async for chunk in async_stream_zip(member_iter()):
+            async for chunk in async_stream_zip(member_iter(), get_compressobj=_store_compressobj):
                 yield chunk
             batch["status"] = "complete" if not job["cancelled"] else "cancelled"
             job["next_batch"] = n + 1

@@ -331,18 +331,50 @@ USE_APIFY = bool(APIFY_TOKEN)
 _APIFY_TIMEOUT = 180  # seconds the actor run may take before we give up
 
 
-def _pick_best_video(item: dict) -> str | None:
-    """Highest-resolution entry from the actor's `video` list, e.g. '720p (HD)'."""
-    best_url, best_res = None, -1
-    for v in item.get("video") or []:
-        url = (v or {}).get("downloadUrl")
-        if not url:
+_URL_KEYS = ("downloadUrl", "download_url", "url", "link", "src", "videoUrl", "video_url", "hd", "sd")
+_NOT_VIDEO_KEYS = ("thumbnail", "thumb", "image", "cover", "audio", "mp3", "avatar", "author", "profile")
+
+
+def _is_fb_page_url(url: str) -> bool:
+    """The post/reel link itself (echoed back by actors), not a media file."""
+    host = (urlparse(url).hostname or "").lower()
+    return host in ("fb.watch", "fb.com") or host == "facebook.com" or host.endswith(".facebook.com")
+
+
+def _video_candidates(node, under_video: bool = False, path: str = ""):
+    """Yield (url, resolution, under_video) for every plausible video URL in an
+    actor result, wherever it is nested. Skips thumbnail/audio branches."""
+    if isinstance(node, dict):
+        label = " ".join(str(node.get(k, "")) for k in ("quality", "label", "resolution", "format", "type"))
+        if any(t in label.lower() for t in ("audio", "mp3")):
+            return
+        m = re.search(r"(\d{3,4})p", label)
+        res = int(m.group(1)) if m else (720 if "hd" in label.lower() else 0)
+        is_video = under_video or "video" in path.lower() or str(node.get("type", "")).lower() == "video"
+        for key in _URL_KEYS:
+            v = node.get(key)
+            if isinstance(v, str) and v.startswith("http") and not _is_fb_page_url(v):
+                yield v, res, is_video or key.lower() in ("hd", "sd")
+        for k, v in node.items():
+            if isinstance(v, (dict, list)) and not any(t in k.lower() for t in _NOT_VIDEO_KEYS):
+                yield from _video_candidates(v, under_video or "video" in k.lower(), f"{path}.{k}")
+    elif isinstance(node, list):
+        for v in node:
+            yield from _video_candidates(v, under_video, path)
+
+
+def _pick_best_video(item) -> str | None:
+    """Best video URL in an actor result: prefer entries under a `video` key,
+    then the highest resolution, then .mp4-looking links."""
+    best, best_rank = None, None
+    for url, res, under_video in _video_candidates(item):
+        low = url.lower()
+        if any(low.split("?")[0].endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".mp3", ".m4a")):
             continue
-        m = re.search(r"(\d{3,4})p", str(v.get("quality", "")))
-        res = int(m.group(1)) if m else 0
-        if res > best_res:
-            best_url, best_res = url, res
-    return best_url
+        rank = (under_video, res, ".mp4" in low or "video" in low)
+        if best_rank is None or rank > best_rank:
+            best, best_rank = url, rank
+    return best
 
 
 async def resolve_via_apify(url: str) -> tuple[str | None, str]:
@@ -373,13 +405,24 @@ async def resolve_via_apify(url: str) -> tuple[str | None, str]:
     try:
         items = r.json()
     except ValueError:
-        items = []
-    for item in items if isinstance(items, list) else []:
-        src = _pick_best_video(item)
-        if src:
-            return src, ""
-    return None, ("Couldn't find a downloadable video at this link. It may be private, "
-                  "removed, or login-gated — only public video/reel links work.")
+        items = None
+    src = _pick_best_video(items) if items else None
+    if src:
+        return src, ""
+
+    raw = r.text.strip()
+    print(f"[apify] no video URL for {url} — HTTP {r.status_code}, response: {raw[:2000]}")
+    if not items:
+        return None, ("Apify returned no result for this link — the video may be private, "
+                      "removed, or login-gated (only public video/reel links work).")
+    # Surface what the actor said (e.g. its own error message) so failures are diagnosable.
+    first = items[0] if isinstance(items, list) else items
+    detail = ""
+    if isinstance(first, dict):
+        detail = next((str(first[k]) for k in ("error", "errorMessage", "message", "status") if first.get(k)), "")
+        if not detail:
+            detail = "fields: " + ", ".join(list(first.keys())[:12])
+    return None, f"Apify returned no downloadable video ({detail[:200] or raw[:200]})."
 
 
 async def resolve_video_src(url: str) -> str | None:

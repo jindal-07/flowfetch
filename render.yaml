@@ -2,6 +2,7 @@ services:
   - type: web
     name: flowfetch
     runtime: docker
+    dockerfilePath: ./Dockerfile.render
     plan: free
     healthCheckPath: /healthz
     envVars:
@@ -17,6 +18,10 @@ services:
       # Password for the login screen. Strongly recommended, since the
       # server can read all tenant files. Changing it logs everyone out.
       - key: FLOWFETCH_PASSWORD
+        sync: false
+      # Apify API token: Facebook links resolve via the easyapi actor instead
+      # of Chromium. Required on Render, whose image has no browser.
+      - key: APIFY_TOKEN
         sync: false
       # How long "Remember me" keeps a device logged in.
       - key: FLOWFETCH_REMEMBER_DAYS

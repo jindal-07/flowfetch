@@ -1,0 +1,25 @@
+FROM python:3.11-slim-bookworm
+
+# Render image: no Chromium. Facebook links resolve through Apify (APIFY_TOKEN)
+# and SharePoint/Drive use HTTP APIs, so no local browser is needed. Use the
+# main Dockerfile wherever Chromium-based Facebook resolving is wanted.
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOST=0.0.0.0 \
+    PORT=10000
+
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH
+WORKDIR /home/user/app
+
+COPY --chown=user:user requirements.txt ./
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+COPY --chown=user:user . .
+
+EXPOSE 10000
+
+CMD ["python", "app.py"]

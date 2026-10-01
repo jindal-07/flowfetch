@@ -300,8 +300,10 @@ async def iter_remote_bytes(src_url: str, chunk_size: int = 1024 * 1024) -> Asyn
     """Yield bytes from a Facebook CDN URL without writing to disk."""
     if not src_url or src_url.startswith(("blob:", "data:")):
         raise RuntimeError(f"Cannot stream non-HTTP URL: {src_url}")
+    host = (urlparse(src_url).hostname or "").lower()
+    headers = _FB_HEADERS if host.endswith(("fbcdn.net", "facebook.com")) else {"User-Agent": DESKTOP_UA}
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=30.0), follow_redirects=True) as client:
-        async with client.stream("GET", src_url, headers=_FB_HEADERS) as r:
+        async with client.stream("GET", src_url, headers=headers) as r:
             if r.status_code not in (200, 206):
                 raise RuntimeError(f"HTTP {r.status_code} for {src_url[:80]}")
             async for chunk in r.aiter_bytes(chunk_size):
@@ -314,8 +316,76 @@ def filename_for(url: str, index: int = 1) -> str:
     return _filename_for(url, index)
 
 
+# ---------------------------------------------------------------------------
+# Apify resolver (optional): resolve video URLs on Apify instead of launching
+# Chromium locally. Enabled when APIFY_TOKEN is set.
+# ---------------------------------------------------------------------------
+
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "").strip()
+APIFY_ACTOR = os.environ.get("APIFY_FB_ACTOR", "easyapi~facebook-video-download").strip().replace("/", "~")
+# Links resolved ahead of the one currently streaming in a batch. Each run has
+# several seconds of start-up, so this keeps batches moving.
+APIFY_PREFETCH = max(1, int(os.environ.get("APIFY_PREFETCH", "3") or 3))
+USE_APIFY = bool(APIFY_TOKEN)
+
+_APIFY_TIMEOUT = 180  # seconds the actor run may take before we give up
+
+
+def _pick_best_video(item: dict) -> str | None:
+    """Highest-resolution entry from the actor's `video` list, e.g. '720p (HD)'."""
+    best_url, best_res = None, -1
+    for v in item.get("video") or []:
+        url = (v or {}).get("downloadUrl")
+        if not url:
+            continue
+        m = re.search(r"(\d{3,4})p", str(v.get("quality", "")))
+        res = int(m.group(1)) if m else 0
+        if res > best_res:
+            best_url, best_res = url, res
+    return best_url
+
+
+async def resolve_via_apify(url: str) -> tuple[str | None, str]:
+    """Run the Apify actor for one link. Returns (download_url, "") or (None, reason)."""
+    endpoint = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_APIFY_TIMEOUT + 30, connect=30.0)) as client:
+            r = await client.post(
+                endpoint,
+                params={"timeout": _APIFY_TIMEOUT},
+                headers={"Authorization": f"Bearer {APIFY_TOKEN}"},
+                json={"url": url},
+            )
+    except httpx.TimeoutException:
+        return None, "Apify took too long to resolve this video — try again shortly."
+    except httpx.HTTPError as e:
+        return None, f"Couldn't reach Apify: {e}"
+
+    if r.status_code == 401:
+        return None, "Apify rejected the API token (check APIFY_TOKEN)."
+    if r.status_code == 402:
+        return None, "Apify account is out of credit for this month."
+    if r.status_code == 404:
+        return None, f"Apify actor '{APIFY_ACTOR}' not found."
+    if r.status_code >= 400:
+        return None, f"Apify error HTTP {r.status_code}: {r.text[:160]}"
+
+    try:
+        items = r.json()
+    except ValueError:
+        items = []
+    for item in items if isinstance(items, list) else []:
+        src = _pick_best_video(item)
+        if src:
+            return src, ""
+    return None, ("Couldn't find a downloadable video at this link. It may be private, "
+                  "removed, or login-gated — only public video/reel links work.")
+
+
 async def resolve_video_src(url: str) -> str | None:
     """Public single-shot helper: launch Playwright, extract the .mp4 URL, close."""
+    if USE_APIFY:
+        return (await resolve_via_apify(url))[0]
     async with async_playwright() as p:
         browser = await _new_browser(p)
         context, page = await _new_page(browser)
@@ -362,6 +432,8 @@ async def resolve_video_with_reason(url: str) -> tuple[str | None, str]:
     or (None, reason) with a human-readable explanation when it is not. Reuses a
     single browser so the check and the resolve are one navigation, not two.
     """
+    if USE_APIFY:
+        return await resolve_via_apify(url)
     async with async_playwright() as p:
         browser = await _new_browser(p)
         context, page = await _new_page(browser)
@@ -600,6 +672,11 @@ async def iter_batch_files(
     if on_progress:
         on_progress(batch_offset, total, f"Starting batch of {len(links)} link(s)...", "info")
 
+    if USE_APIFY:
+        async for entry in _iter_batch_files_apify(links, on_progress, should_cancel, batch_offset, total):
+            yield entry
+        return
+
     async with async_playwright() as p:
         browser = await _new_browser(p)
         context, page = await _new_page(browser)
@@ -672,6 +749,67 @@ async def iter_batch_files(
                 await browser.close()
             except Exception:
                 pass
+
+
+async def _iter_batch_files_apify(links, on_progress, should_cancel, batch_offset, total):
+    """Apify flavour of iter_batch_files: no local browser. Up to APIFY_PREFETCH
+    links are resolved ahead while the current video streams."""
+    pending: dict[int, asyncio.Task] = {}
+
+    def _prefetch(upto: int):
+        for i in range(upto, min(upto + APIFY_PREFETCH, len(links))):
+            if i not in pending:
+                pending[i] = asyncio.create_task(resolve_via_apify(links[i]))
+
+    try:
+        for i, url in enumerate(links):
+            idx_overall = batch_offset + i + 1
+            if should_cancel and should_cancel():
+                if on_progress:
+                    on_progress(idx_overall - 1, total, "Cancelled by user.", "cancelled")
+                return
+
+            basename = _filename_for(url, idx_overall)
+            info = extract_post_info(url)
+            label = f"{info['kind']} {info['id']}" if info["id"] else url
+            if on_progress:
+                on_progress(idx_overall, total, f"Resolving: {label}", "processing")
+
+            _prefetch(i)
+            try:
+                video_src, reason = await pending.pop(i)
+            except Exception as e:
+                video_src, reason = None, f"Resolve error: {e}"
+
+            if not video_src:
+                if on_progress:
+                    on_progress(idx_overall, total, reason, "failed")
+                yield None, None, {"url": url, "status": "failed", "file": None}
+                continue
+
+            if on_progress:
+                on_progress(idx_overall, total, f"Streaming: {basename}", "processing")
+
+            result = {"url": url, "status": "pending", "file": basename}
+
+            async def _stream_with_status(src=video_src, res=result, idx=idx_overall, name=basename):
+                try:
+                    async for chunk in iter_remote_bytes(src):
+                        yield chunk
+                    res["status"] = "success"
+                    if on_progress:
+                        on_progress(idx, total, f"Saved: {name}", "success", name)
+                except Exception as e:
+                    res["status"] = "failed"
+                    res["file"] = None
+                    if on_progress:
+                        on_progress(idx, total, f"Stream failed: {e}", "failed")
+                    raise
+
+            yield basename, _stream_with_status(), result
+    finally:
+        for task in pending.values():
+            task.cancel()
 
 
 if __name__ == "__main__":

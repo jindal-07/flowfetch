@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libdrm2 \
         libgbm1 \
         libglib2.0-0 \
+        libatomic1 \
         libnspr4 \
         libnss3 \
         libpango-1.0-0 \
@@ -44,6 +45,14 @@ WORKDIR /home/user/app
 
 COPY --chown=user:user requirements.txt ./
 RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Let the installed Playwright version add any system libraries its Chromium
+# needs beyond the list above (needs root; packages are in the user's site dir).
+USER root
+RUN PYTHONPATH="$(echo /home/user/.local/lib/python3*/site-packages)" \
+        python -m playwright install-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+USER user
 
 # Install only the Chromium browser (smaller than full install).
 RUN python -m playwright install chromium

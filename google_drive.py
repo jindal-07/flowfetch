@@ -20,12 +20,13 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import mimetypes
 import os
 import random
 import re
 from html import unescape as _html_unescape
 from typing import AsyncIterator, Callable, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import httpx
 import pandas as pd
@@ -37,6 +38,7 @@ MEDIA_EXT = VIDEO_EXT | {".jpg", ".jpeg", ".png", ".gif", ".heic", ".webp", ".mp
 
 GOOGLE_NATIVE_PREFIX = "application/vnd.google-apps"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+_DOC_MIME_RE = re.compile(r'"docs-dm":"([^"]+)"')
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -181,10 +183,10 @@ def _session() -> requests.Session:
 def _page_title(html: str, fallback: str = "") -> str:
     m = _OG_TITLE_RE.search(html)
     if m:
-        return m.group(1).strip()
+        return _html_unescape(m.group(1)).strip()
     m = _TITLE_RE.search(html)
     if m:
-        return m.group(1).replace(" - Google Drive", "").strip()
+        return _html_unescape(m.group(1)).replace(" - Google Drive", "").strip()
     return fallback
 
 
@@ -218,30 +220,67 @@ def _probe_file_accessible(file_id: str, session: requests.Session) -> bool:
     return not _is_login_wall(r.text or "")
 
 
+_FORM_ACTION_RE = re.compile(r'<form[^>]*id="download-form"[^>]*action="([^"]+)"', re.I)
+_HIDDEN_INPUT_RE = re.compile(r'<input[^>]*type="hidden"[^>]*>', re.I)
+_ATTR_RE = re.compile(r'(name|value)="([^"]*)"')
+
+
+def _drive_html_reason(html: str) -> str:
+    """Human-readable reason for an HTML page Google served instead of a file."""
+    low = html.lower()
+    if "too many users have viewed or downloaded" in low or "quota" in low:
+        return ("Google's download limit for this file has been reached "
+                "(too many recent downloads) — try again later.")
+    if _is_login_wall(html) or "you need access" in low:
+        return "This file is not shared as 'Anyone with the link'."
+    if "not found" in low or "404" in low:
+        return "File not found or no longer shared."
+    title = _TITLE_RE.search(html)
+    page = _html_unescape(title.group(1)).strip() if title else "an unexpected page"
+    return f"Google returned a web page ('{page}') instead of the file."
+
+
+def _virus_scan_form_url(html: str) -> str | None:
+    """
+    Large files (>~100 MB) get a "can't scan for viruses — Download anyway"
+    page. Rebuild the URL its form submits (drive.usercontent.google.com with
+    id/export/confirm/uuid), which is what "Download anyway" does in a browser.
+    """
+    m = _FORM_ACTION_RE.search(html)
+    if not m:
+        return None
+    params = {}
+    for tag in _HIDDEN_INPUT_RE.findall(html):
+        attrs = dict(_ATTR_RE.findall(tag))
+        if attrs.get("name"):
+            params[attrs["name"]] = _html_unescape(attrs.get("value", ""))
+    if "id" not in params:
+        return None
+    return _html_unescape(m.group(1)) + "?" + urlencode(params)
+
+
 def build_public_download_url(file_id: str,
                               session: requests.Session | None = None
                               ) -> tuple[str, requests.Session]:
     """
-    Resolve the final uc?export=download URL for a public file, handling the
-    virus-scan confirmation page for large files.
+    Resolve a URL that serves the file's bytes, handling the virus-scan
+    confirmation page for large files. Raises RuntimeError with a readable
+    reason when Google won't serve the file.
     """
     session = session or _session()
     base = f"https://drive.google.com/uc?export=download&id={file_id}"
-    resp = session.get(base, stream=True, timeout=60)
+    with session.get(base, stream=True, timeout=60) as resp:
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        if resp.status_code == 200 and "text/html" not in ct:
+            return base, session
+        if resp.status_code == 404:
+            raise FileNotFoundError("File not found or not shared as 'Anyone with the link'.")
+        html = resp.text
 
-    ct = (resp.headers.get("Content-Type") or "").lower()
-    if "text/html" not in ct:
-        return base, session
-
-    token = None
-    for key, value in resp.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
-    if not token:
-        m = re.search(r"confirm=([0-9A-Za-z_]+)", resp.text)
-        token = m.group(1) if m else "t"
-    return f"{base}&confirm={token}", session
+    url = _virus_scan_form_url(html)
+    if url:
+        return url, session
+    raise RuntimeError(_drive_html_reason(html))
 
 
 def public_file_meta(file_id: str, session: requests.Session | None = None) -> dict:
@@ -264,11 +303,14 @@ def public_file_meta(file_id: str, session: requests.Session | None = None) -> d
                 "Set sharing to 'Anyone with the link' and try again."
             )
         name = f"gdrive_{file_id[:8]}"
-    mime = ""
-    if GOOGLE_NATIVE_PREFIX in html:
-        m = re.search(r'(application/vnd\.google-apps\.[a-z.]+)', html)
-        if m:
-            mime = m.group(1)
+    # `docs-dm` is the item's own type (e.g. video/mp4, or the folder type for
+    # open?id= links that point at a folder). Other google-apps types appear
+    # elsewhere in the page's config, so a page-wide search misclassifies files.
+    m = _DOC_MIME_RE.search(html)
+    mime = m.group(1) if m else ""
+    if mime and "." not in name and not mime.startswith(GOOGLE_NATIVE_PREFIX):
+        ext = mimetypes.guess_extension(mime) or ""
+        name += ext
 
     return {
         "id": file_id,
@@ -399,9 +441,40 @@ async def iter_remote_bytes(file_id: str,
                 except Exception:
                     msg = ""
                 raise RuntimeError(f"HTTP {r.status_code} downloading file. {msg}")
+            # Never save a Google web page (quota/limit/warning) as the file.
+            if "text/html" in (r.headers.get("Content-Type") or "").lower():
+                html = (await r.aread())[:200_000].decode("utf-8", "ignore")
+                raise RuntimeError(_drive_html_reason(html))
+            expected = int(r.headers.get("Content-Length") or 0)
+            received = 0
             async for chunk in r.aiter_bytes(chunk_size):
                 if chunk:
+                    received += len(chunk)
                     yield chunk
+            if expected and received < expected:
+                raise RuntimeError(
+                    f"Download cut off: got {received/1e6:.0f} MB of {expected/1e6:.0f} MB."
+                )
+
+
+async def _primed(it: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    """Fetch the first chunk now, so resolve errors surface before an HTTP
+    response has started; return an iterator that replays it."""
+    agen = it.__aiter__()
+    try:
+        first = await agen.__anext__()
+    except StopAsyncIteration:
+        first = None
+
+    async def replay():
+        try:
+            if first is not None:
+                yield first
+            async for c in agen:
+                yield c
+        finally:
+            await agen.aclose()
+    return replay()
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +514,22 @@ async def crawl_folder(folder_url: str,
 # Streaming batch helpers
 # ---------------------------------------------------------------------------
 
+def _folder_link_message(folder_id: str, name: str) -> str:
+    """Explain that a link is a folder, listing the file links inside it."""
+    try:
+        files = [f for f in extract_media_from_folder(folder_id, media_only=False)
+                 if f.get("mime") != FOLDER_MIME]
+    except Exception:
+        files = []
+    msg = f"This link is a folder ('{name}'), not a file — use the Folder tab"
+    if not files:
+        return msg + "."
+    links = ", ".join(f"{f['name']}: https://drive.google.com/file/d/{f['id']}/view"
+                      for f in files[:5])
+    more = f" (+{len(files) - 5} more)" if len(files) > 5 else ""
+    return f"{msg}, or use the file link(s) inside it: {links}{more}"
+
+
 async def resolve_single_stream(url: str) -> tuple[str, AsyncIterator[bytes]]:
     info = parse_drive_url(url)
     if info["kind"] == "unknown" or not info["id"]:
@@ -448,13 +537,15 @@ async def resolve_single_stream(url: str) -> tuple[str, AsyncIterator[bytes]]:
 
     meta = await asyncio.to_thread(public_file_meta, info["id"])
     mime = meta.get("mime") or ""
+    if mime == FOLDER_MIME:
+        raise RuntimeError(await asyncio.to_thread(_folder_link_message, info["id"], meta.get("name", "")))
     if mime.startswith(GOOGLE_NATIVE_PREFIX):
         raise RuntimeError(
             "This is a Google-native document (Docs/Sheets/Slides). "
             "Export it manually or use a media file instead."
         )
     name = _safe_filename(meta.get("name") or "gdrive_file")
-    return name, iter_remote_bytes(info["id"])
+    return name, await _primed(iter_remote_bytes(info["id"]))
 
 
 async def iter_batch_files(links: list[str],
@@ -493,6 +584,13 @@ async def iter_batch_files(links: list[str],
 
         name = _safe_filename(meta.get("name") or f"file_{idx_overall}")
         mime = meta.get("mime") or ""
+
+        if mime == FOLDER_MIME:
+            reason = await asyncio.to_thread(_folder_link_message, info["id"], name)
+            if on_progress:
+                on_progress(idx_overall, total, reason, "failed")
+            yield None, None, {"url": url, "status": "failed", "file": None}
+            continue
 
         if mime.startswith(GOOGLE_NATIVE_PREFIX):
             if on_progress:

@@ -294,7 +294,8 @@ async def check_link(request: Request, source: str, url: str):
                 name, _ = await sp_downloader.resolve_single_stream(url, SP_STATE_FILE)
             return {"ok": True, "reason": "", "filename": name}
         if source == "gdrive":
-            name, _ = await gd.resolve_single_stream(url)
+            name, probe = await gd.resolve_single_stream(url)
+            await probe.aclose()  # the check only needed the first chunk
             return {"ok": True, "reason": "", "filename": name}
         return {"ok": False, "reason": "Unknown source."}
     except HTTPException as e:
